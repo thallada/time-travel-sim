@@ -1,0 +1,19 @@
+FROM mitmproxy/mitmproxy:10.1.1
+
+USER root
+
+COPY mitm/addon.py /opt/addon.py
+COPY mitm/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Ensure the mitmproxy home and cert directory exist with correct ownership
+# Some mitmproxy versions write certs to ~/.mitmproxy/, others directly to ~/
+RUN mkdir -p /home/mitmproxy/.mitmproxy && \
+    chown -R mitmproxy:mitmproxy /home/mitmproxy && \
+    chmod -R 755 /home/mitmproxy
+
+USER mitmproxy
+
+EXPOSE 8080
+
+ENTRYPOINT ["/entrypoint.sh"]

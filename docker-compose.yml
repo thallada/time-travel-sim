@@ -1,0 +1,119 @@
+version: "3.8"
+
+# ============================================================
+# Claude Time-Travel Simulation Environment
+# ============================================================
+# This creates a sealed environment where all web requests
+# are transparently routed through the Wayback Machine for
+# a target date, while Anthropic API calls pass through to
+# the real internet. A custom Claude client runs inside the
+# VM with locally-executed tools.
+#
+# Usage:
+#   1. Copy .env.example to .env and set your ANTHROPIC_API_KEY
+#   2. docker compose up --build
+#   3. docker compose exec sandbox bash
+#   4. Inside the sandbox: python3 /app/claude_client.py
+# ============================================================
+
+services:
+  # -----------------------------------------------------------
+  # DNS: Resolves ALL domains to the proxy IP, except
+  # api.anthropic.com which resolves to its real IP.
+  # -----------------------------------------------------------
+  dns:
+    build:
+      context: .
+      dockerfile: Dockerfile.dns
+    container_name: tt-dns
+    networks:
+      tt-net:
+        ipv4_address: 172.30.0.2
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # Wayback Proxy: Fetches pages from archive.org for the
+  # target date and strips all Wayback artifacts.
+  # Runs on port 8888 (HTTP proxy).
+  # -----------------------------------------------------------
+  wayback-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.wayback
+    container_name: tt-wayback
+    environment:
+      - WAYBACK_DATE=${WAYBACK_DATE:-20100715}
+      - TOLERANCE=${TOLERANCE:-30}
+    networks:
+      tt-net:
+        ipv4_address: 172.30.0.3
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # MITM Proxy: Sits in front of everything. Terminates TLS,
+  # routes Anthropic API calls to the real internet, and
+  # sends everything else through WaybackProxy.
+  # -----------------------------------------------------------
+  mitm-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.mitm
+    container_name: tt-mitm
+    ports:
+      - "8080:8080"
+    depends_on:
+      - wayback-proxy
+    networks:
+      tt-net:
+        ipv4_address: 172.30.0.4
+    restart: unless-stopped
+
+  # -----------------------------------------------------------
+  # Sandbox: The sealed environment where the Claude client
+  # runs. System clock is faked to 2010. All DNS goes through
+  # our fake DNS. All HTTP/HTTPS goes through the MITM proxy.
+  # -----------------------------------------------------------
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    container_name: tt-sandbox
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - TARGET_DATE=${TARGET_DATE:-2010-07-15T09:30:00}
+      # Model and thinking configuration
+      - MODEL=${MODEL:-claude-sonnet-4-20250514}
+      - EXTENDED_THINKING=${EXTENDED_THINKING:-false}
+      - THINKING_BUDGET=${THINKING_BUDGET:-10000}
+      # HTTP requests go directly to WaybackProxy
+      - http_proxy=http://172.30.0.3:8888
+      - HTTP_PROXY=http://172.30.0.3:8888
+      # HTTPS requests go through mitmproxy (only used for Anthropic API)
+      - https_proxy=http://172.30.0.4:8080
+      - HTTPS_PROXY=http://172.30.0.4:8080
+      - no_proxy=172.30.0.3,172.30.0.4
+      # Trust the MITM CA for HTTPS
+      - REQUESTS_CA_BUNDLE=/usr/local/share/ca-certificates/mitmproxy-ca.crt
+      - SSL_CERT_FILE=/usr/local/share/ca-certificates/mitmproxy-ca.crt
+      - NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mitmproxy-ca.crt
+    dns:
+      - 172.30.0.2
+    depends_on:
+      - dns
+      - mitm-proxy
+      - wayback-proxy
+    cap_add:
+      - SYS_TIME    # needed for faketime / date manipulation
+    networks:
+      tt-net:
+        ipv4_address: 172.30.0.10
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+networks:
+  tt-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

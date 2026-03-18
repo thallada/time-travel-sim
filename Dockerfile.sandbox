@@ -1,0 +1,36 @@
+FROM python:3.11-slim
+
+# Install system tools that Claude might try to use
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    dnsutils \
+    net-tools \
+    ca-certificates \
+    libfaketime \
+    jq \
+    lynx \
+    w3m \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages
+RUN pip install --no-cache-dir \
+    anthropic \
+    requests \
+    beautifulsoup4 \
+    httpx \
+    rich \
+    prompt_toolkit
+
+# Copy the Claude client and tools
+COPY sandbox/ /app/
+
+# Copy the MITM CA cert (will be generated on first run)
+# We handle this in the entrypoint
+COPY sandbox/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+WORKDIR /app
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
