@@ -1,23 +1,30 @@
 #!/bin/bash
 set -e
 
-echo "=== Time Travel Sandbox ==="
-echo "Target date: ${TARGET_DATE}"
+# Convert TARGET_DATE from ISO format (with T) to faketime format (with space)
+TARGET_STR=$(echo "${TARGET_DATE}" | sed 's/T/ /')
+export FAKETIME="@${TARGET_STR}"
 
-# --- Fake the system time ---
-# libfaketime intercepts time syscalls
-# It expects "YYYY-MM-DD HH:MM:SS" format (space separator, not T)
-FAKETIME_STR=$(echo "${TARGET_DATE}" | sed 's/T/ /')
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
-export FAKETIME="${FAKETIME_STR}"
-export FAKETIME_NO_CACHE=1
+# Persist FAKETIME for any future shells (docker exec, su, etc.)
+# This ensures every bash session in the container gets the fake time
+echo "export FAKETIME=\"@${TARGET_STR}\"" > /etc/profile.d/faketime.sh
+echo "export FAKETIME=\"@${TARGET_STR}\"" >> /etc/bash.bashrc
 
-echo "System time is now: $(date)"
+# Verify it works
+TEST_DATE=$(date +%Y)
+if [ "$TEST_DATE" = "2010" ]; then
+    echo "Time simulation active: $(date)"
+else
+    echo "WARNING: faketime not working. date reports year=$TEST_DATE"
+    echo "  LD_PRELOAD=$LD_PRELOAD"
+    echo "  FAKETIME=$FAKETIME"
+fi
 
-# --- Install MITM CA certificate ---
-# Wait for mitmproxy to generate its CA cert, then trust it
-# Use --noproxy to bypass the env proxy vars for this specific request
-echo "Waiting for MITM proxy CA certificate..."
+# Fetch MITM CA cert — temporarily unset LD_PRELOAD so curl
+# doesn't have TLS issues with a 2010 clock
+SAVED_PRELOAD="$LD_PRELOAD"
+unset LD_PRELOAD
+
 MAX_WAIT=30
 WAITED=0
 while [ $WAITED -lt $MAX_WAIT ]; do
@@ -25,25 +32,16 @@ while [ $WAITED -lt $MAX_WAIT ]; do
         if [ -s /tmp/mitmproxy-ca.pem ]; then
             cp /tmp/mitmproxy-ca.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt
             update-ca-certificates 2>/dev/null || true
-            echo "MITM CA certificate installed."
             break
         fi
     fi
     sleep 1
     WAITED=$((WAITED + 1))
 done
+rm -f /tmp/mitmproxy-ca.pem
 
-if [ $WAITED -ge $MAX_WAIT ]; then
-    echo "WARNING: Could not fetch MITM CA cert. HTTPS may not work."
-fi
+# Restore LD_PRELOAD
+export LD_PRELOAD="$SAVED_PRELOAD"
 
 echo ""
-echo "=== Environment Ready ==="
-echo "  Fake date:    $(date)"
-echo "  HTTP proxy:   172.30.0.3:8888 (WaybackProxy)"
-echo "  HTTPS proxy:  172.30.0.4:8080 (mitmproxy → Anthropic API)"
-echo ""
-echo "Run: python3 /app/claude_client.py"
-echo ""
-
 exec "$@"

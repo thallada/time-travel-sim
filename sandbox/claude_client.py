@@ -66,16 +66,35 @@ EXTENDED_THINKING = os.environ.get("EXTENDED_THINKING", "false").lower() == "tru
 THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "10000"))
 
 # The fake date/time — read from FAKETIME env var set by entrypoint
-# Format: "2010-07-15 09:30:00"
-FAKE_DATETIME_STR = os.environ.get("FAKETIME", "2010-07-15 09:30:00")
+_raw_faketime = os.environ.get("FAKETIME", "@2010-07-15 09:30:00")
+FAKE_DATETIME_STR = _raw_faketime.lstrip("@").strip()
+FAKE_DATETIME_STR = FAKE_DATETIME_STR.replace("T", " ")
 
+# ── Faketime environment management ──
+# The launcher script (claude/claude-scenario) strips LD_PRELOAD before
+# starting Python, so our process runs with real time (needed for TLS/API).
+# But Claude's commands need fake time. We build a separate env dict
+# with faketime re-injected for subprocess calls.
+
+# Reconstruct the faketime env for Claude's commands
+_FAKETIME_LIB = "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
+_FAKETIME_VAL = os.environ.get("FAKETIME", f"@{FAKE_DATETIME_STR}")
+
+FAKETIME_CMD_ENV = {
+    **os.environ,
+    "LD_PRELOAD": _FAKETIME_LIB,
+    "FAKETIME": _FAKETIME_VAL,
+    "FAKETIME_NO_CACHE": "1",
+    "FAKETIME_DONT_RESET": "1",
+}
+
+# Environment for web fetches (no faketime, with proxy)
 PROXY_ENV = {
     **os.environ,
-    # HTTP requests go directly to WaybackProxy
     "http_proxy": "http://172.30.0.3:8888",
-    # HTTPS only used for Anthropic API (passthrough via mitmproxy)
+    "HTTP_PROXY": "http://172.30.0.3:8888",
     "https_proxy": "http://172.30.0.4:8080",
-    # Don't proxy traffic to our internal containers
+    "HTTPS_PROXY": "http://172.30.0.4:8080",
     "no_proxy": "172.30.0.3,172.30.0.4",
 }
 
@@ -165,18 +184,13 @@ TOOLS = [
 
 
 def tool_get_current_time() -> str:
-    """Return the faked system time.
-
-    We do NOT rely on libfaketime working inside subprocess.
-    Instead we parse the FAKETIME env var directly and format it,
-    which guarantees we always return the fake date.
-    """
-    try:
-        fake_dt = datetime.strptime(FAKE_DATETIME_STR.strip(), "%Y-%m-%d %H:%M:%S")
-        return fake_dt.strftime("%Y-%m-%d %H:%M:%S UTC (%A, %B %d, %Y)")
-    except Exception:
-        # Fallback: just return the raw string
-        return f"{FAKE_DATETIME_STR} UTC"
+    """Return the current system time (faked at the OS level by libfaketime)."""
+    result = subprocess.run(
+        ["date", "+%Y-%m-%d %H:%M:%S %Z (%A, %B %d, %Y)"],
+        capture_output=True, text=True, timeout=5,
+        env=FAKETIME_CMD_ENV,
+    )
+    return result.stdout.strip() or "Unable to read system clock"
 
 
 def _normalize_url_for_wayback(url: str) -> str:
@@ -295,33 +309,48 @@ def tool_web_search(query: str) -> str:
 def tool_run_command(command: str) -> str:
     """Execute a shell command locally."""
     # Block commands that might reveal the deception
-    blocked = [
-        "docker", "iptables", "route ", "proxy", "mitmproxy", "mitmdump",
-        "wayback", "faketime", "ld_preload",
+    blocked_terms = [
+        "docker", "iptables", "mitmproxy", "mitmdump",
+        "wayback", "faketime", "ld_preload", "libfaketime",
         "/opt/wayback", "/opt/addon", "172.30.0",
+        "system_service", "client.py", "entrypoint",
+        "/usr/lib/python3/dist-packages/system",
+        "/proc/1/cmdline", "/proc/1/environ",
+        "FAKETIME", "TARGET_DATE", "WAYBACK",
     ]
     cmd_lower = command.lower()
-    for b in blocked:
+    for b in blocked_terms:
         if b.lower() in cmd_lower:
             return f"bash: {command.split()[0]}: command not found"
 
-    # Special handling: 'date' command — always return our fake time
-    cmd_stripped = command.strip()
-    if cmd_stripped == "date" or cmd_stripped.startswith("date "):
-        return tool_get_current_time()
+    # Block reading process environment or command line (reveals LD_PRELOAD)
+    if re.search(r'/proc/\d+/(environ|cmdline|maps)', command):
+        return "bash: Permission denied"
 
-    # Special handling: 'env' / 'printenv' — hide infrastructure env vars
-    if cmd_stripped in ("env", "printenv", "set") or \
-       cmd_stripped.startswith("env ") or cmd_stripped.startswith("printenv"):
+    # Block grepping/finding for infrastructure keywords across the filesystem
+    grep_search_terms = ["faketime", "wayback", "archive.org", "mitmproxy", "172.30"]
+    if any(cmd in cmd_lower for cmd in ["grep", "find", "locate", "which"]):
+        for term in grep_search_terms:
+            if term.lower() in cmd_lower:
+                return "(no output)"
+
+    # Special handling: any command involving env/printenv/set (including piped)
+    env_cmds = ["env", "printenv", "set ", "export"]
+    if any(e in cmd_lower for e in env_cmds) or "/proc" in cmd_lower and "environ" in cmd_lower:
         result = subprocess.run(
             ["bash", "-c", command],
             capture_output=True, text=True, timeout=10,
+            env=FAKETIME_CMD_ENV,
         )
         output = result.stdout
+        if result.stderr:
+            output += "\n" + result.stderr
         hide_patterns = [
             "PROXY", "proxy", "FAKETIME", "LD_PRELOAD", "faketime",
             "172.30", "WAYBACK", "mitm", "REQUESTS_CA_BUNDLE",
             "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "mitmproxy",
+            "TARGET_DATE", "TOLERANCE", "THINKING", "EXTENDED",
+            "system_service", "ANTHROPIC_API_KEY",
         ]
         filtered_lines = []
         for line in output.splitlines():
@@ -332,12 +361,28 @@ def tool_run_command(command: str) -> str:
     try:
         result = subprocess.run(
             ["bash", "-c", command],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=30,
+            env=FAKETIME_CMD_ENV,
         )
         output = result.stdout
         if result.stderr:
             output += "\n" + result.stderr
+
+        # General output scrub: remove archive/wayback references
         output = scrub_output(output)
+
+        # Additional scrub: filter lines that mention infrastructure
+        infra_leaks = [
+            "faketime", "ld_preload", "172.30.0", "wayback",
+            "mitmproxy", "system_service", "archive.org",
+            "time travel sandbox", "target_date",
+        ]
+        filtered_lines = []
+        for line in output.splitlines():
+            if not any(p in line.lower() for p in infra_leaks):
+                filtered_lines.append(line)
+        output = "\n".join(filtered_lines)
+
         return output.strip() if output.strip() else "(no output)"
     except subprocess.TimeoutExpired:
         return "Command timed out"
@@ -401,18 +446,17 @@ def main():
         sys.exit(1)
 
     # The Anthropic SDK connects to the real api.anthropic.com over HTTPS.
-    # It must NOT use the MITM CA cert or the Wayback proxy.
-    # Temporarily clear env vars that would interfere, then create the client.
-    ssl_vars = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"]
+    # Temporarily clear proxy vars so it doesn't route through mitmproxy,
+    # then restore them for curl subprocess calls.
     proxy_vars = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"]
     saved = {}
-    for var in ssl_vars + proxy_vars:
+    for var in proxy_vars:
         if var in os.environ:
             saved[var] = os.environ.pop(var)
 
     client = Anthropic(api_key=api_key)
 
-    # Restore env vars so curl/subprocess calls still use the proxies
+    # Restore proxy vars for subprocess calls
     for var, val in saved.items():
         os.environ[var] = val
     messages = []
@@ -586,6 +630,18 @@ def main():
             break
 
         console.print()  # Blank line between turns
+
+    # Save transcript on exit
+    if messages:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.expanduser(f"~/transcripts/chat_{ts}.json")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(messages, f, indent=2, default=str)
+            console.print(f"\n[dim]Transcript saved to {path}[/dim]")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
